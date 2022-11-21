@@ -1,6 +1,8 @@
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId, Admin } = require("mongodb");
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
+
 require("dotenv").config();
 require("colors");
 
@@ -19,6 +21,36 @@ const client = new MongoClient(uri, {
   useUnifiedTopology: true,
   serverApi: ServerApiVersion.v1,
 });
+
+//JWT verify function workinG
+function verifyJWT(req, res, next) {
+  // console.log("Token find in server", req.headers.authorization);
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).send("Unauthorized access.");
+  }
+  const token = authHeader.split(" ")[1];
+
+  //verify
+  jwt.verify(token, process.env.ACCESS_TOKEN, function (err, decoded) {
+    if (err) {
+      return res.status(403).send({ message: "Forbidden access." });
+    }
+    req.decoded = decoded;
+    next();
+  });
+}
+/*
+
+*API naming convention
+*app.get('/bookings')
+*app.get('/bookings/:id')
+*app.post('/bookings')
+*app.patch('/bookings/:id')
+*app.delete('/bookings/:id')
+******
+
+*/
 // client.connect((err) => {
 //   const collection = client.db("test").collection("devices");
 //   // perform actions on the collection object
@@ -32,17 +64,57 @@ async function run() {
       .collection("appointmentOptions");
     // collection --2 bookings
     const bookingsCollection = client.db("accuDental").collection("bookings");
+    // collection --3 user
+    const usersCollection = client.db("accuDental").collection("users");
+    // collection --4 doctors
+    const doctorsCollection = client.db("accuDental").collection("doctors");
 
     // Read data --1
+    // to do :Use aggregate to query multiple collection and then merge data
     app.get("/appointmentOptions", async (req, res) => {
+      const date = req.query.date;
+
       const query = {};
       const options = await appointmentOptionCollection.find(query).toArray();
+
+      //get the bookings of the provided date
+      const bookingQuery = { appointmentDate: date };
+      const alreadyBooked = await bookingsCollection
+        .find(bookingQuery)
+        .toArray();
+      // console.log(alreadyBooked); Code carefully
+      options.forEach((option) => {
+        const optionBooked = alreadyBooked.filter(
+          (book) => book.treatment === option.name
+        );
+        // console.log(optionBooked); //reload appointment page page
+        const bookedSlots = optionBooked.map((book) => book.slot);
+        const remainingSlots = option?.slots.filter(
+          (slot) => !bookedSlots.includes(slot)
+        );
+        option.slots = remainingSlots;
+        // console.log(option.name, remainingSlots.length); //reload appointment page page
+      });
+      res.send(options);
+    });
+    //--1 for selecting specialty get some specific data from the api where id will be included by default but it also can be ignored.// test http://localhost:5005/appointmentSpecialty
+    app.get(`/appointmentSpecialty`, async (req, res) => {
+      const query = {};
+      const options = await appointmentOptionCollection
+        .find(query)
+        .project({ name: 1 })
+        .toArray();
       res.send(options);
     });
 
-    //read data --2
-    app.get(`/bookings`, async (req, res) => {
-      const query = {};
+    //read data --2 workinG
+    app.get(`/bookings`, verifyJWT, async (req, res) => {
+      const email = req.query.email;
+      const decodedEmail = req.decoded.email;
+      if (email !== decodedEmail) {
+        return res.status(403).send("Forbidden Access");
+      }
+      const query = { email: email };
       const options = await bookingsCollection.find(query).toArray();
       res.send(options);
     });
@@ -50,7 +122,90 @@ async function run() {
     app.post("/bookings", async (req, res) => {
       const booking = req.body;
       // console.log(booking);
+      const query = {
+        appointmentDate: booking.appointmentDate,
+        treatment: booking.treatment,
+        email: booking.email,
+      };
+      const alreadyBooked = await bookingsCollection.find(query).toArray();
+      if (alreadyBooked.length) {
+        const message = `You already hvae a booking on ${booking.appointmentDate}`;
+        return res.send({ acknowledged: false, message });
+      }
       const result = await bookingsCollection.insertOne(booking);
+      res.send(result);
+    });
+
+    //get Data --3
+    app.get(`/users`, async (req, res) => {
+      const query = {};
+      const users = await usersCollection.find(query).toArray();
+      res.send(users);
+    });
+
+    //Post data --3
+    app.post("/users", async (req, res) => {
+      const user = req.body;
+      const result = await usersCollection.insertOne(user);
+      // console.log(result);
+      res.send(result);
+    });
+
+    //get admin --3 fetch this is admin data using custom hook in the client site
+    app.get(`/users/admin/:email`, async (req, res) => {
+      const email = req.params.email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+      // console.log("hello", user);
+      res.send({ isAdmin: user?.role === "admin" });
+      // console.log(user.role);
+      // console.log({ isAdmin: user?.role === "admin" });
+    });
+    //update data for making admin --3     Q?
+    app.put("/users/admin/:id", verifyJWT, async (req, res) => {
+      const decodedEmail = req.decoded.email;
+      const query = { email: decodedEmail };
+      const user = await usersCollection.findOne(query);
+      if (user?.role !== "admin") {
+        //kmne 1st admin?
+        return req.status(403).send({ message: "Forbidden access" });
+      }
+
+      const id = req.params.id;
+      const filter = { _id: ObjectId(id) };
+      const options = { upsert: true };
+      const updatedDoc = { $set: { role: "admin" } };
+      const result = await usersCollection.updateOne(
+        filter,
+        updatedDoc,
+        options
+      );
+      res.send(result);
+    });
+    //jwt check: http://localhost:5005/jwt?email=tt@tt.com
+    app.get("/jwt", async (req, res) => {
+      const email = req.query.email;
+      const query = { email: email };
+      const user = await usersCollection.find(query).toArray();
+      // console.log(user);
+      if (user) {
+        const token = jwt.sign({ email }, process.env.ACCESS_TOKEN, {
+          expiresIn: "1d",
+        });
+        return res.send({ accessToken: token });
+      }
+      res.status(403).send({ accessToken: "" });
+    });
+    //--4 get doctors data
+    app.get(`/doctors`, async (req, res) => {
+      const query = {};
+      const doctor = await doctorsCollection.find(query).toArray();
+      res.send(doctor);
+    });
+    //--4 post doctor collection
+    app.post("/doctors", async (req, res) => {
+      const doctor = req.body;
+      const result = await doctorsCollection.insertOne(doctor);
       res.send(result);
     });
   } finally {
